@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+# Local secrets — never commit these
+examples/.env
+*.authkey
+*.ts-authkey
+
+# Generated user-data files
+*-userdata.yaml
+*-userdata.yml

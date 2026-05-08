@@ -1,0 +1,220 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""
+insta-exit-node — stand up a Tailscale exit node on a Debian/Ubuntu VM.
+
+Subcommands:
+  ssh         Provision an already-running VM over SSH.
+  cloud-init  Emit a cloud-init user-data document that self-provisions on first boot.
+"""
+import argparse
+import base64
+import os
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+
+PROVISION_PY = Path(__file__).resolve().parent.parent / "provision.py"
+
+
+def resolve_authkey(args):
+    if getattr(args, "authkey", None):
+        return args.authkey
+    if getattr(args, "authkey_file", None):
+        return Path(args.authkey_file).read_text().strip()
+    env_val = os.environ.get("TS_AUTHKEY", "")
+    if env_val:
+        return env_val
+    sys.exit(
+        "Error: no auth key provided. Use --authkey, --authkey-file, or set TS_AUTHKEY."
+    )
+
+
+def build_prov_args(args):
+    """Build provisioner CLI args (authkey excluded — handled separately per transport)."""
+    prov_args = []
+    if getattr(args, "hostname", None):
+        prov_args += ["--hostname", args.hostname]
+    for tag in getattr(args, "tags", []):
+        prov_args += ["--tag", tag]
+    for route in getattr(args, "routes", []):
+        prov_args += ["--advertise-route", route]
+    if not getattr(args, "ssh", True):
+        prov_args.append("--no-ssh")
+    if not getattr(args, "ipv6", True):
+        prov_args.append("--no-ipv6-forwarding")
+    if getattr(args, "reset", False):
+        prov_args.append("--reset")
+    return prov_args
+
+
+def cmd_ssh(args):
+    host = args.host
+    ssh_key = getattr(args, "ssh_key", None)
+    authkey = resolve_authkey(args)
+
+    if not PROVISION_PY.exists():
+        sys.exit(f"Error: provision.py not found at {PROVISION_PY}")
+
+    ssh_opts = ["-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes"]
+    if ssh_key:
+        ssh_opts += ["-i", ssh_key]
+
+    scp_cmd = ["scp"] + ssh_opts + [str(PROVISION_PY), f"{host}:/tmp/provision.py"]
+    print(f"[insta-exit-node] Copying provision.py to {host}...")
+    subprocess.run(scp_cmd, check=True)
+
+    prov_args = build_prov_args(args) + ["--authkey-file", "/tmp/.ts-authkey"]
+    prov_cmd = "sudo python3 /tmp/provision.py " + " ".join(
+        shlex.quote(a) for a in prov_args
+    )
+
+    # Pipe authkey via stdin so it never appears in ps or shell history on the target.
+    # Remote sequence: write key → run provisioner → shred key (cleanup even on failure).
+    remote_sh = (
+        "cat > /tmp/.ts-authkey && "
+        "chmod 600 /tmp/.ts-authkey && "
+        f"{prov_cmd}; "
+        "rc=$?; "
+        "shred -u /tmp/.ts-authkey 2>/dev/null || rm -f /tmp/.ts-authkey; "
+        "exit $rc"
+    )
+
+    ssh_cmd = ["ssh"] + ssh_opts + [host, remote_sh]
+    print(f"[insta-exit-node] Running provisioner on {host}...")
+    result = subprocess.run(ssh_cmd, input=authkey.encode())
+    sys.exit(result.returncode)
+
+
+def _yaml_scalar(s):
+    """Quote a string for use in a YAML flow sequence if it contains special chars."""
+    needs_quoting = any(c in s for c in ' \t\n:{}[],"\'\\#&*?|>!%@`')
+    if needs_quoting:
+        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return s
+
+
+def cmd_cloud_init(args):
+    authkey = resolve_authkey(args)
+
+    if not PROVISION_PY.exists():
+        sys.exit(f"Error: provision.py not found at {PROVISION_PY}")
+
+    provision_b64 = base64.b64encode(PROVISION_PY.read_bytes()).decode()
+    authkey_b64 = base64.b64encode(authkey.encode()).decode()
+
+    prov_args = ["--authkey-file", "/root/.ts-authkey"] + build_prov_args(args)
+    runcmd_list = ["python3", "/usr/local/sbin/provision.py"] + prov_args
+    runcmd_item = "  - [" + ", ".join(_yaml_scalar(a) for a in runcmd_list) + "]"
+
+    cloud_config = f"""#cloud-config
+write_files:
+  - path: /usr/local/sbin/provision.py
+    permissions: '0755'
+    owner: root:root
+    encoding: b64
+    content: {provision_b64}
+  - path: /root/.ts-authkey
+    permissions: '0600'
+    owner: root:root
+    encoding: b64
+    content: {authkey_b64}
+runcmd:
+{runcmd_item}
+  - shred -u /root/.ts-authkey 2>/dev/null || rm -f /root/.ts-authkey
+"""
+    print(cloud_config, end="")
+
+
+def add_shared_args(p):
+    key_group = p.add_mutually_exclusive_group()
+    key_group.add_argument(
+        "--authkey", help="Tailscale auth key (or TS_AUTHKEY env var)"
+    )
+    key_group.add_argument(
+        "--authkey-file", metavar="PATH", help="Path to file containing the auth key"
+    )
+    p.add_argument("--hostname", default=None, help="Tailscale node hostname")
+    p.add_argument(
+        "--tag",
+        action="append",
+        dest="tags",
+        default=[],
+        metavar="TAG",
+        help="Advertise tag (repeatable, e.g. --tag tag:exit)",
+    )
+    p.add_argument(
+        "--advertise-route",
+        action="append",
+        dest="routes",
+        default=[],
+        metavar="CIDR",
+        help="Subnet route to advertise (repeatable)",
+    )
+    p.add_argument(
+        "--no-ssh",
+        action="store_false",
+        dest="ssh",
+        help="Disable Tailscale SSH (enabled by default)",
+    )
+    p.add_argument(
+        "--no-ipv6-forwarding",
+        action="store_false",
+        dest="ipv6",
+        help="Disable IPv6 forwarding (enabled by default)",
+    )
+    p.add_argument(
+        "--reset", action="store_true", help="Pass --reset to tailscale up on the target"
+    )
+    p.set_defaults(ssh=True, ipv6=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Stand up a Tailscale exit node on a Debian/Ubuntu VM.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  # SSH into an existing VM
+  export TS_AUTHKEY=tskey-auth-...
+  uv run bin/insta-exit-node ssh --host root@1.2.3.4 --hostname my-exit --tag tag:exit
+
+  # Generate cloud-init user-data (pipe into provider CLI)
+  export TS_AUTHKEY=tskey-auth-...
+  uv run bin/insta-exit-node cloud-init --hostname my-exit --tag tag:exit > userdata.yaml
+""",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    ssh_p = subparsers.add_parser("ssh", help="Provision an already-running VM via SSH.")
+    ssh_p.add_argument(
+        "--host",
+        required=True,
+        metavar="USER@IP",
+        help="SSH target, e.g. root@1.2.3.4 or ubuntu@1.2.3.4",
+    )
+    ssh_p.add_argument(
+        "--ssh-key", metavar="PATH", help="Path to SSH private key (optional)"
+    )
+    add_shared_args(ssh_p)
+
+    ci_p = subparsers.add_parser(
+        "cloud-init",
+        help="Emit a cloud-init user-data document that self-provisions on first boot.",
+    )
+    add_shared_args(ci_p)
+
+    args = parser.parse_args()
+    if args.command == "ssh":
+        cmd_ssh(args)
+    elif args.command == "cloud-init":
+        cmd_cloud_init(args)
+
+
+if __name__ == "__main__":
+    main()
