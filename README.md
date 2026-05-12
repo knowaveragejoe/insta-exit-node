@@ -13,14 +13,25 @@ Both flows run the same on-VM provisioner (`provision.py`) which is idempotent �
 
 ---
 
+## TL;DR
+
+0. Install [`uv`](#prerequisites) on your local machine.
+1. [Set up Tailscale](#step-1-tailscale-setup) — add an auto-approver ACL, then mint an auth key tagged `tag:exit`.
+2. [Configure your secrets](#step-2-configure-your-secrets) — copy `examples/.env.example` to `examples/.env` and fill it in.
+3. Pick a flow:
+   - [**SSH**](#step-3a-ssh-flow-provision-an-existing-vm) — you already have a VM you can SSH into.
+   - [**cloud-init**](#step-3b-cloud-init-flow-vm-self-provisions-on-first-boot) — generate user-data and pass it to your provider; the VM provisions itself on first boot.
+4. [Use your new exit node](#step-4-use-the-exit-node) from any device on your tailnet.
+
+See also: [Security considerations](#security-considerations).
+
+---
+
 ## Prerequisites
 
 **On your machine (operator side):**
 
-- [`uv`](https://docs.astral.sh/uv/getting-started/installation/) — the only dependency:
-  ```bash
-  curl -LsSf https://astral.sh/uv/install.sh | sh
-  ```
+- `uv` — the only dependency; install it via your package manager or whatever method you prefer.
 - `ssh` and `scp` (for the SSH flow)
 - A cloud provider account with a Debian/Ubuntu VM (or the ability to create one)
 
