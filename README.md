@@ -21,7 +21,7 @@ Both flows run the same on-VM provisioner (`provision.py`) which is idempotent �
 3. Pick a flow:
    - [**SSH**](#step-3a-ssh-flow-provision-an-existing-vm) — you already have a VM you can SSH into.
    - [**cloud-init**](#step-3b-cloud-init-flow-vm-self-provisions-on-first-boot) — generate user-data and pass it to your provider; the VM provisions itself on first boot.
-4. [Use the exit node](#step-4-use-the-exit-node) from any device on your tailnet.
+4. [Use your new exit node](#step-4-use-the-exit-node) from any device on your tailnet.
 
 See also: [Security considerations](#security-considerations).
 
