@@ -15,29 +15,15 @@ Both flows run the same on-VM provisioner (`provision.py`) which is idempotent �
 
 ## TL;DR
 
-```bash
-# 0. Install uv (one-time)
-curl -LsSf https://astral.sh/uv/install.sh | sh
+0. Install [`uv`](#prerequisites) on your local machine.
+1. [Set up Tailscale](#step-1-tailscale-setup) — add an auto-approver ACL, then mint an auth key tagged `tag:exit`.
+2. [Configure your secrets](#step-2-configure-your-secrets) — copy `examples/.env.example` to `examples/.env` and fill it in.
+3. Pick a flow:
+   - [**SSH**](#step-3a-ssh-flow-provision-an-existing-vm) — you already have a VM you can SSH into.
+   - [**cloud-init**](#step-3b-cloud-init-flow-vm-self-provisions-on-first-boot) — generate user-data and pass it to your provider; the VM provisions itself on first boot.
+4. [Use the exit node](#step-4-use-the-exit-node) from any device on your tailnet.
 
-# 1. In the Tailscale admin console: add the auto-approver ACL, then generate an auth key
-#    tagged `tag:exit`. (See Step 1 for details.)
-
-# 2. Configure secrets
-cp examples/.env.example examples/.env && chmod 600 examples/.env
-$EDITOR examples/.env       # set TS_AUTHKEY, EXIT_HOST, EXIT_HOSTNAME, EXIT_TAG
-
-# 3a. SSH flow — provision an existing VM
-./examples/run.sh
-
-# 3b. cloud-init flow — VM self-provisions on first boot
-uv run bin/insta-exit-node cloud-init --hostname insta-exit-1 --tag tag:exit > userdata.yaml
-# then pass userdata.yaml to your provider (e.g. doctl ... --user-data-file)
-
-# 4. Use it from any tailnet device
-tailscale up --exit-node=insta-exit-1 --exit-node-allow-lan-access=false
-```
-
-Jump to: [Prerequisites](#prerequisites) · [Step 1: Tailscale setup](#step-1-tailscale-setup) · [Step 2: Configure secrets](#step-2-configure-your-secrets) · [Step 3a: SSH flow](#step-3a-ssh-flow-provision-an-existing-vm) · [Step 3b: cloud-init flow](#step-3b-cloud-init-flow-vm-self-provisions-on-first-boot) · [Step 4: Use the exit node](#step-4-use-the-exit-node) · [Security considerations](#security-considerations)
+See also: [Security considerations](#security-considerations).
 
 ---
 
@@ -45,10 +31,7 @@ Jump to: [Prerequisites](#prerequisites) · [Step 1: Tailscale setup](#step-1-ta
 
 **On your machine (operator side):**
 
-- [`uv`](https://docs.astral.sh/uv/getting-started/installation/) — the only dependency:
-  ```bash
-  curl -LsSf https://astral.sh/uv/install.sh | sh
-  ```
+- `uv` — the only dependency; install it via your package manager or whatever method you prefer.
 - `ssh` and `scp` (for the SSH flow)
 - A cloud provider account with a Debian/Ubuntu VM (or the ability to create one)
 
