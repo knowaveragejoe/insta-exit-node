@@ -54,6 +54,8 @@ Go to **Admin console → Access controls** and add these entries to your policy
 
 Save. Any node tagged `tag:exit` will be auto-approved as an exit node — no manual click required.
 
+> **Minimum recommended, intentionally permissive.** The snippet above is the smallest ACL change needed to make auto-approval work; it does not constrain who on your tailnet can use the exit node or SSH into it. For anything beyond a personal tailnet you control end-to-end, you'll want to add `acls` and `ssh` blocks that restrict access to specific users/groups. See [Tailscale's ACL docs](https://tailscale.com/kb/1018/acls).
+
 > **Note:** If you don't add this rule, your exit node will appear in the admin console but other devices won't be able to route through it until you manually approve it under **Machines → (node) → Edit route settings**.
 
 ### 1b. Create an auth key
@@ -283,6 +285,43 @@ ssh root@<ip> 'tailscale status'
 **Exit node appears but can't be selected by other devices:**
 - Verify your ACL has the `autoApprovers.exitNode` rule (Step 1a)
 - Or manually approve under **Machines → (node) → Edit route settings**
+
+---
+
+## Security considerations
+
+This is a small tool with a small attack surface, but a few tradeoffs are worth understanding before you deploy.
+
+### Cloud-init exposes the auth key via the metadata service
+
+In the cloud-init flow, the auth key is embedded (base64) in the user-data document. Although `provision.py` shreds the on-disk copy at `/root/.ts-authkey` after `tailscale up` completes, **the original user-data remains readable from inside the VM** via the cloud metadata service for the lifetime of the instance — e.g. on DigitalOcean:
+
+```bash
+curl http://169.254.169.254/metadata/v1/user-data
+```
+
+Anything on the VM that can reach `169.254.169.254` (any process, any future code execution, anyone who reads cloud-init logs) can recover the key.
+
+**Recommendations:**
+
+- **Use a single-use (non-reusable) auth key for the cloud-init flow.** It gets consumed by `tailscale up` on first boot; a leaked copy afterwards is useless for registering new nodes. The README earlier recommends "Reusable" for convenience when re-running the provisioner — that convenience only applies to the SSH flow.
+- If you need reusable keys with cloud-init, prefer the SSH flow instead: it pipes the key over the SSH channel and never writes it into user-data.
+- On providers that support it, disable or firewall the metadata service after first boot.
+
+### SSH flow uses trust-on-first-use
+
+`bin/insta-exit-node ssh` connects with `StrictHostKeyChecking=accept-new`, which accepts whatever host key the server presents on the first connection and pins it thereafter. This is the same TOFU model `ssh` uses by default for new hosts.
+
+The window of risk is small (the few seconds between droplet creation and the SCP) but non-zero: an attacker who can intercept traffic to the VM's IP during that window — a malicious upstream, a hijacked floating IP, an attacker who has compromised your provider's control plane — could capture the auth key.
+
+**Recommendations:**
+
+- For high-assurance use, pre-seed `~/.ssh/known_hosts` with the VM's host key fingerprint obtained out-of-band (most providers expose this in their web console or via an API).
+- For everyday personal use, TOFU is generally acceptable; just be aware that the auth key is what's at stake on a successful MITM.
+
+### Tailscale SSH is enabled by default
+
+The provisioner runs `tailscale up --ssh`, which means any tailnet member your ACL allows can SSH into the exit node. Combined with a permissive default ACL, this is broader access than you probably want. Either tighten your `ssh` ACL block (see Tailscale's [SSH ACL docs](https://tailscale.com/kb/1193/tailscale-ssh)) or pass `--no-ssh` to disable it entirely.
 
 ---
 
