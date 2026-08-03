@@ -141,14 +141,19 @@ uv run bin/insta-exit-node ssh \
 The script will:
 1. Copy `provision.py` to the VM over SCP
 2. SSH in, install Tailscale from the official apt repo, configure IP forwarding, and run `tailscale up`
-3. Print `tailscale status` so you can confirm the node is up
+3. Print `tailscale status`, then confirm the control plane has actually **approved** the exit node
 
 Expected output (last few lines):
 ```
 [provision] tailscale status:
 [provision]   100.x.x.x  insta-exit-1  (exit node)
+[provision] Exit node is advertised and approved — ready to use.
 [provision] Provisioning complete.
 ```
+
+If the auto-approver ACL from [Step 1a](#1a-add-an-auto-approver-acl-rule) is missing, the provisioner
+waits ~30s for approval and then warns instead — the node will exist but no device
+can route through it until you approve it.
 
 ---
 
@@ -182,7 +187,7 @@ write_files:
     encoding: b64
     content: <base64-encoded auth key>
 runcmd:
-  - [python3, /usr/local/sbin/provision.py, --authkey-file, /root/.ts-authkey, --hostname, insta-exit-1, --tag, "tag:exit"]
+  - ["python3", "/usr/local/sbin/provision.py", "--authkey-file", "/root/.ts-authkey", "--hostname", "insta-exit-1", "--tag", "tag:exit"]
   - shred -u /root/.ts-authkey 2>/dev/null || rm -f /root/.ts-authkey
 ```
 
@@ -294,8 +299,13 @@ ssh root@<ip> 'tailscale status'
 - Look for errors in `journalctl -u tailscaled`
 
 **Exit node appears but can't be selected by other devices:**
+
+The provisioner detects this itself and ends with a `WARNING:` block instead of
+`Exit node is advertised and approved`. To fix:
 - Verify your ACL has the `autoApprovers.exitNode` rule (Step 1a)
 - Or manually approve under **Machines → (node) → Edit route settings**
+
+Re-run the provisioner afterwards (it's idempotent) to confirm approval landed.
 
 ---
 
