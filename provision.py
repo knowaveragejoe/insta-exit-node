@@ -4,10 +4,12 @@ Provision a Debian/Ubuntu VM as a Tailscale exit node.
 Runs on the target VM as root. Idempotent — safe to re-run.
 """
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -151,6 +153,31 @@ def tailscale_up(authkey, hostname, tags, routes, ssh, reset):
     run(cmd)
 
 
+EXIT_ROUTES = ("0.0.0.0/0", "::/0")
+APPROVAL_TIMEOUT = 30
+
+
+def status_json():
+    try:
+        return json.loads(run_out(["tailscale", "status", "--json"]))
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return None
+
+
+def exit_node_approved(status):
+    """True once the control plane has granted this node exit-node routes.
+
+    Self.ExitNodeOption is set only when the node both advertises an exit node
+    and has been approved. AllowedIPs is the underlying signal it derives from,
+    checked as a fallback for older tailscale builds.
+    """
+    self_status = (status or {}).get("Self") or {}
+    if self_status.get("ExitNodeOption"):
+        return True
+    allowed = self_status.get("AllowedIPs") or []
+    return any(route in allowed for route in EXIT_ROUTES)
+
+
 def verify():
     log("Verifying exit node status...")
     try:
@@ -160,6 +187,27 @@ def verify():
             log(f"  {line}")
     except subprocess.CalledProcessError:
         log("Warning: could not retrieve tailscale status.")
+
+    # Advertising an exit node is only half the job — until the control plane
+    # approves it, no device on the tailnet can route through this VM. Approval
+    # normally lands within seconds of registration, so poll briefly.
+    deadline = time.monotonic() + APPROVAL_TIMEOUT
+    status = status_json()
+    while not exit_node_approved(status) and time.monotonic() < deadline:
+        time.sleep(2)
+        status = status_json()
+
+    if status is None:
+        log("Warning: could not parse `tailscale status --json`; skipping approval check.")
+    elif exit_node_approved(status):
+        log("Exit node is advertised and approved — ready to use.")
+    else:
+        log("WARNING: this node advertises an exit node, but the control plane has")
+        log("         not approved it, so no device can route through it yet.")
+        log("         Fix: add an autoApprovers.exitNode rule for your tag, or approve")
+        log("         manually under Machines -> (node) -> Edit route settings.")
+        log("         See https://tailscale.com/kb/1019/subnets/#auto-approvers")
+
     log("Provisioning complete.")
 
 

@@ -12,6 +12,7 @@ Subcommands:
 """
 import argparse
 import base64
+import json
 import os
 import shlex
 import subprocess
@@ -76,9 +77,11 @@ def cmd_ssh(args):
 
     # Pipe authkey via stdin so it never appears in ps or shell history on the target.
     # Remote sequence: write key → run provisioner → shred key (cleanup even on failure).
+    # umask 077 first: the key file must never exist world-readable, not even for the
+    # instant between creation and a follow-up chmod.
     remote_sh = (
+        "umask 077 && "
         "cat > /tmp/.ts-authkey && "
-        "chmod 600 /tmp/.ts-authkey && "
         f"{prov_cmd}; "
         "rc=$?; "
         "shred -u /tmp/.ts-authkey 2>/dev/null || rm -f /tmp/.ts-authkey; "
@@ -89,14 +92,6 @@ def cmd_ssh(args):
     print(f"[insta-exit-node] Running provisioner on {host}...")
     result = subprocess.run(ssh_cmd, input=authkey.encode())
     sys.exit(result.returncode)
-
-
-def _yaml_scalar(s):
-    """Quote a string for use in a YAML flow sequence if it contains special chars."""
-    needs_quoting = any(c in s for c in ' \t\n:{}[],"\'\\#&*?|>!%@`')
-    if needs_quoting:
-        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
-    return s
 
 
 def cmd_cloud_init(args):
@@ -110,7 +105,9 @@ def cmd_cloud_init(args):
 
     prov_args = ["--authkey-file", "/root/.ts-authkey"] + build_prov_args(args)
     runcmd_list = ["python3", "/usr/local/sbin/provision.py"] + prov_args
-    runcmd_item = "  - [" + ", ".join(_yaml_scalar(a) for a in runcmd_list) + "]"
+    # JSON is a subset of YAML 1.2, so json.dumps produces a correctly escaped
+    # double-quoted YAML scalar for any input — no hand-rolled quoting needed.
+    runcmd_item = "  - [" + ", ".join(json.dumps(a) for a in runcmd_list) + "]"
 
     cloud_config = f"""#cloud-config
 write_files:
