@@ -9,6 +9,11 @@ insta-exit-node — stand up a Tailscale exit node on a Debian/Ubuntu VM.
 Subcommands:
   ssh         Provision an already-running VM over SSH.
   cloud-init  Emit a cloud-init user-data document that self-provisions on first boot.
+  authkey     Mint a short-lived auth key and print it.
+
+If no auth key is supplied, one is minted through the Tailscale API using OAuth
+client credentials. The client secret stays on this machine: it is never written
+into user-data, sent to the target host, or logged.
 """
 import argparse
 import base64
@@ -20,7 +25,93 @@ import sys
 from pathlib import Path
 
 
-PROVISION_PY = Path(__file__).resolve().parent.parent / "provision.py"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+PROVISION_PY = REPO_ROOT / "provision.py"
+
+sys.path.insert(0, str(REPO_ROOT))
+import tsapi  # noqa: E402  — needs REPO_ROOT on sys.path first
+
+
+def log(msg):
+    """Progress goes to stderr so stdout stays usable for piped output."""
+    print(f"[insta-exit-node] {msg}", file=sys.stderr)
+
+
+def api_token(args):
+    """Return a Tailscale API access token, or None if no credentials were given."""
+    api_key = getattr(args, "api_key", None) or os.environ.get("TS_API_KEY", "")
+    if api_key:
+        return api_key
+    client_id = getattr(args, "oauth_client_id", None) or os.environ.get(
+        "TS_OAUTH_CLIENT_ID", ""
+    )
+    client_secret = getattr(args, "oauth_client_secret", None) or os.environ.get(
+        "TS_OAUTH_CLIENT_SECRET", ""
+    )
+    if client_id and client_secret:
+        log("Exchanging OAuth client credentials for an access token...")
+        return tsapi.exchange_oauth_token(client_id, client_secret)
+    if client_id or client_secret:
+        sys.exit(
+            "Error: an OAuth client needs both an ID and a secret "
+            "(--oauth-client-id / --oauth-client-secret, or "
+            "TS_OAUTH_CLIENT_ID / TS_OAUTH_CLIENT_SECRET)."
+        )
+    return None
+
+
+def preflight(token, tailnet, tags):
+    """Verify the tailnet policy before anything gets provisioned."""
+    log("Checking tailnet policy...")
+    try:
+        policy = tsapi.get_policy_file(token, tailnet=tailnet)
+    except tsapi.TailscaleAPIError as exc:
+        # Usually just a token without policy_file:read. Not worth blocking on —
+        # the on-VM approval check still catches an unapproved node later.
+        log(f"Warning: could not read policy file ({exc}); skipping preflight.")
+        return
+    problems = tsapi.check_acl(policy, tags)
+    if problems:
+        sys.exit(
+            "Error: your tailnet policy is missing entries this exit node needs.\n\n"
+            + "\n\n".join(problems)
+            + "\n\nNothing was provisioned. Update Access controls and re-run, or "
+            "pass --no-preflight to skip this check."
+        )
+    log(f"Policy OK ({', '.join(tags)} auto-approved as an exit node).")
+
+
+def mint_authkey(args):
+    """Mint a short-lived single-use auth key through the Tailscale API."""
+    try:
+        token = api_token(args)
+    except tsapi.TailscaleAPIError as exc:
+        sys.exit(f"Error: OAuth token exchange failed: {exc}")
+    if not token:
+        sys.exit(
+            "Error: no auth key, and no API credentials to mint one.\n"
+            "  Supply a key with --authkey, --authkey-file or $TS_AUTHKEY, or set\n"
+            "  TS_OAUTH_CLIENT_ID and TS_OAUTH_CLIENT_SECRET to mint keys automatically."
+        )
+    tags = getattr(args, "tags", []) or []
+    if not tags:
+        sys.exit(
+            "Error: --tag is required when minting a key. Keys created through the "
+            "API are owned by the tailnet, and Tailscale requires them to be tagged."
+        )
+    if not getattr(args, "no_preflight", False):
+        preflight(token, args.tailnet, tags)
+    log(f"Minting auth key (single-use, ephemeral, expires in {args.key_expiry}s)...")
+    try:
+        return tsapi.create_auth_key(
+            token,
+            tags=tags,
+            hostname=getattr(args, "hostname", None),
+            expiry_seconds=args.key_expiry,
+            tailnet=args.tailnet,
+        )
+    except tsapi.TailscaleAPIError as exc:
+        sys.exit(f"Error: could not create auth key: {exc}")
 
 
 def resolve_authkey(args):
@@ -31,9 +122,7 @@ def resolve_authkey(args):
     env_val = os.environ.get("TS_AUTHKEY", "")
     if env_val:
         return env_val
-    sys.exit(
-        "Error: no auth key provided. Use --authkey, --authkey-file, or set TS_AUTHKEY."
-    )
+    return mint_authkey(args)
 
 
 def build_prov_args(args):
@@ -57,17 +146,20 @@ def build_prov_args(args):
 def cmd_ssh(args):
     host = args.host
     ssh_key = getattr(args, "ssh_key", None)
-    authkey = resolve_authkey(args)
 
+    # Check local prerequisites before resolving the key: resolving may mint one,
+    # and a key burned on a run that then fails locally is wasted.
     if not PROVISION_PY.exists():
         sys.exit(f"Error: provision.py not found at {PROVISION_PY}")
+
+    authkey = resolve_authkey(args)
 
     ssh_opts = ["-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes"]
     if ssh_key:
         ssh_opts += ["-i", ssh_key]
 
     scp_cmd = ["scp"] + ssh_opts + [str(PROVISION_PY), f"{host}:/tmp/provision.py"]
-    print(f"[insta-exit-node] Copying provision.py to {host}...")
+    log(f"Copying provision.py to {host}...")
     subprocess.run(scp_cmd, check=True)
 
     prov_args = build_prov_args(args) + ["--authkey-file", "/tmp/.ts-authkey"]
@@ -89,16 +181,16 @@ def cmd_ssh(args):
     )
 
     ssh_cmd = ["ssh"] + ssh_opts + [host, remote_sh]
-    print(f"[insta-exit-node] Running provisioner on {host}...")
+    log(f"Running provisioner on {host}...")
     result = subprocess.run(ssh_cmd, input=authkey.encode())
     sys.exit(result.returncode)
 
 
 def cmd_cloud_init(args):
-    authkey = resolve_authkey(args)
-
     if not PROVISION_PY.exists():
         sys.exit(f"Error: provision.py not found at {PROVISION_PY}")
+
+    authkey = resolve_authkey(args)
 
     provision_b64 = base64.b64encode(PROVISION_PY.read_bytes()).decode()
     authkey_b64 = base64.b64encode(authkey.encode()).decode()
@@ -126,6 +218,11 @@ runcmd:
   - shred -u /root/.ts-authkey 2>/dev/null || rm -f /root/.ts-authkey
 """
     print(cloud_config, end="")
+
+
+def cmd_authkey(args):
+    """Mint a key and print it to stdout, for scripting."""
+    print(mint_authkey(args))
 
 
 def add_shared_args(p):
@@ -168,6 +265,38 @@ def add_shared_args(p):
     p.add_argument(
         "--reset", action="store_true", help="Pass --reset to tailscale up on the target"
     )
+    p.add_argument(
+        "--oauth-client-id",
+        metavar="ID",
+        help="Tailscale OAuth client ID (or TS_OAUTH_CLIENT_ID)",
+    )
+    p.add_argument(
+        "--oauth-client-secret",
+        metavar="SECRET",
+        help="Tailscale OAuth client secret (or TS_OAUTH_CLIENT_SECRET)",
+    )
+    p.add_argument(
+        "--api-key",
+        metavar="KEY",
+        help="Tailscale API access token, used instead of an OAuth client (or TS_API_KEY)",
+    )
+    p.add_argument(
+        "--tailnet",
+        default=tsapi.DEFAULT_TAILNET,
+        help="Tailnet to operate on (default: '-', this token's default tailnet)",
+    )
+    p.add_argument(
+        "--key-expiry",
+        type=int,
+        default=tsapi.DEFAULT_KEY_EXPIRY,
+        metavar="SECONDS",
+        help=f"Lifetime of a minted auth key (default: {tsapi.DEFAULT_KEY_EXPIRY})",
+    )
+    p.add_argument(
+        "--no-preflight",
+        action="store_true",
+        help="Skip the tailnet policy check before minting a key",
+    )
     p.set_defaults(ssh=True, ipv6=True)
 
 
@@ -177,13 +306,16 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  # SSH into an existing VM
-  export TS_AUTHKEY=tskey-auth-...
+  # Mint a key automatically from OAuth client credentials
+  export TS_OAUTH_CLIENT_ID=... TS_OAUTH_CLIENT_SECRET=tskey-client-...
   uv run bin/insta-exit-node ssh --host root@1.2.3.4 --hostname my-exit --tag tag:exit
 
-  # Generate cloud-init user-data (pipe into provider CLI)
-  export TS_AUTHKEY=tskey-auth-...
+  # Generate cloud-init user-data (pipe into your provider's CLI)
   uv run bin/insta-exit-node cloud-init --hostname my-exit --tag tag:exit > userdata.yaml
+
+  # Bring your own key instead
+  export TS_AUTHKEY=tskey-auth-...
+  uv run bin/insta-exit-node ssh --host root@1.2.3.4 --tag tag:exit
 """,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -206,11 +338,19 @@ examples:
     )
     add_shared_args(ci_p)
 
+    key_p = subparsers.add_parser(
+        "authkey",
+        help="Mint a short-lived auth key and print it to stdout.",
+    )
+    add_shared_args(key_p)
+
     args = parser.parse_args()
     if args.command == "ssh":
         cmd_ssh(args)
     elif args.command == "cloud-init":
         cmd_cloud_init(args)
+    elif args.command == "authkey":
+        cmd_authkey(args)
 
 
 if __name__ == "__main__":

@@ -17,7 +17,11 @@ else
   echo "Hint: copy examples/.env.example to examples/.env and fill in your values."
 fi
 
-: "${TS_AUTHKEY:?TS_AUTHKEY is required. Set it in examples/.env or in the environment.}"
+if [ -z "${TS_AUTHKEY:-}" ] && { [ -z "${TS_OAUTH_CLIENT_ID:-}" ] || [ -z "${TS_OAUTH_CLIENT_SECRET:-}" ]; }; then
+  echo "Error: set TS_OAUTH_CLIENT_ID and TS_OAUTH_CLIENT_SECRET (to mint keys" >&2
+  echo "       automatically), or TS_AUTHKEY, in examples/.env." >&2
+  exit 1
+fi
 : "${EXIT_HOST:?EXIT_HOST is required (e.g. root@1.2.3.4). Set it in examples/.env.}"
 
 EXIT_HOSTNAME="${EXIT_HOSTNAME:-insta-exit-1}"
