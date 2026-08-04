@@ -15,7 +15,11 @@ if [ -f "${ENV_FILE}" ]; then
   set +a
 fi
 
-: "${TS_AUTHKEY:?TS_AUTHKEY is required.}"
+if [ -z "${TS_AUTHKEY:-}" ] && { [ -z "${TS_OAUTH_CLIENT_ID:-}" ] || [ -z "${TS_OAUTH_CLIENT_SECRET:-}" ]; }; then
+  echo "Error: set TS_OAUTH_CLIENT_ID and TS_OAUTH_CLIENT_SECRET (to mint keys" >&2
+  echo "       automatically), or TS_AUTHKEY, in examples/.env." >&2
+  exit 1
+fi
 : "${DO_SSH_KEY:?DO_SSH_KEY is required (doctl compute ssh-key list to find yours).}"
 
 EXIT_HOSTNAME="${EXIT_HOSTNAME:-insta-exit-1}"

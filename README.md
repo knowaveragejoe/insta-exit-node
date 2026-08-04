@@ -12,7 +12,7 @@ Two flows, both running the same idempotent on-VM provisioner (`provision.py`):
 ## Quickstart
 
 1. Install [`uv`](https://docs.astral.sh/uv/).
-2. [Set up Tailscale](#1-tailscale-setup) — auto-approver ACL, then an auth key tagged `tag:exit`.
+2. [Set up Tailscale](#1-tailscale-setup) — auto-approver ACL, then an OAuth client tagged `tag:exit`.
 3. `cp examples/.env.example examples/.env && chmod 600 examples/.env`, then fill it in.
 4. Run the [SSH](#2a-ssh-flow) or [cloud-init](#2b-cloud-init-flow) flow.
 5. [Use it](#3-use-the-exit-node) from any device on your tailnet.
@@ -36,18 +36,25 @@ Without it, the node appears in the console but stays unusable until you approve
 
 > This is the minimum needed to make auto-approval work, and it is intentionally permissive — it does not restrict who may *use* the exit node or SSH into it. Beyond a personal tailnet, add `acls` and `ssh` blocks. See the [ACL docs](https://tailscale.com/kb/1018/acls).
 
-### Auth key
+### OAuth client
 
-**Admin console → Settings → Keys → Generate auth key**, with **Ephemeral** ✓ (the node self-removes when the VM dies) and **Tags** `tag:exit`. Mark it **Reusable** only for the SSH flow — for cloud-init, prefer single-use ([why](#auth-key-exposure-cloud-init)).
+**Admin console → Settings → OAuth clients → Generate**, with scopes `auth_keys` and `policy_file:read`, and tag `tag:exit`.
 
-Then fill in `examples/.env` (or just export `TS_AUTHKEY`):
+The tag matters: keys minted through the API are owned by the tailnet, and Tailscale requires a key's tags to match those of the client that created it.
+
+Then fill in `examples/.env`:
 
 ```bash
-TS_AUTHKEY=tskey-auth-kXXXXXXXX-XXXXXXXXXXXX
+TS_OAUTH_CLIENT_ID=kXXXXXXXXCNTRL
+TS_OAUTH_CLIENT_SECRET=tskey-client-XXXXXXXXXXXX
 EXIT_HOST=root@1.2.3.4        # SSH flow only
 EXIT_HOSTNAME=insta-exit-1
 EXIT_TAG=tag:exit
 ```
+
+Each run now mints its own auth key — single-use, ephemeral, pre-authorized, expiring in 10 minutes — so there's no key to store, rotate, or remember to revoke. The client secret stays on your machine: it never enters user-data, never reaches the VM, and is never logged.
+
+> **Prefer to manage keys yourself?** Set `TS_AUTHKEY` (or pass `--authkey`) and minting is skipped entirely. Generate the key under **Settings → Keys** with **Ephemeral** ✓ and **Tags** `tag:exit`.
 
 ## 2a. SSH flow
 
@@ -67,14 +74,16 @@ Set `EXIT_HOST=root@<ip>` from the output, then:
 uv run bin/insta-exit-node ssh --host root@1.2.3.4 --hostname insta-exit-1 --tag tag:exit
 ```
 
-This copies `provision.py` to the VM, installs Tailscale from the official apt repo, enables IP forwarding, runs `tailscale up`, and confirms the control plane actually approved the exit node:
+This checks your tailnet policy and mints a key before touching the VM, then copies `provision.py` over, installs Tailscale from the official apt repo, enables IP forwarding, runs `tailscale up`, and confirms the control plane actually approved the exit node:
 
 ```
+[insta-exit-node] Policy OK (tag:exit auto-approved as an exit node).
+[insta-exit-node] Minting auth key (single-use, ephemeral, expires in 600s)...
 [provision]   100.x.x.x  insta-exit-1  (exit node)
 [provision] Exit node is advertised and approved — ready to use.
 ```
 
-If the auto-approver ACL is missing, it waits ~30s for approval, then warns instead.
+If the auto-approver ACL is missing, the policy check fails immediately with the snippet to paste, before any VM work happens. Pass `--no-preflight` to skip it.
 
 ## 2b. cloud-init flow
 
@@ -108,12 +117,21 @@ tailscale up --exit-node=       # stop routing through it
 ```
 uv run bin/insta-exit-node ssh --host USER@IP [options]
 uv run bin/insta-exit-node cloud-init [options]
+uv run bin/insta-exit-node authkey [options]     # mint a key, print it
 ```
+
+Key resolution order: `--authkey` → `--authkey-file` → `$TS_AUTHKEY` → mint via the API. Progress messages go to stderr, so `cloud-init` and `authkey` output can be redirected safely.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--authkey KEY` | `$TS_AUTHKEY` | Tailscale auth key |
+| `--authkey KEY` | `$TS_AUTHKEY` | Tailscale auth key (skips minting) |
 | `--authkey-file PATH` | — | File containing the auth key |
+| `--oauth-client-id ID` | `$TS_OAUTH_CLIENT_ID` | OAuth client ID, used to mint keys |
+| `--oauth-client-secret S` | `$TS_OAUTH_CLIENT_SECRET` | OAuth client secret |
+| `--api-key KEY` | `$TS_API_KEY` | API access token, instead of an OAuth client |
+| `--tailnet NAME` | `-` | Tailnet to operate on (`-` = the token's own) |
+| `--key-expiry SECONDS` | `600` | Lifetime of a minted key |
+| `--no-preflight` | off | Skip the tailnet policy check |
 | `--hostname NAME` | system hostname | Tailscale node hostname |
 | `--tag TAG` | — | Advertise tag (repeatable) |
 | `--advertise-route CIDR` | — | Subnet route to advertise (repeatable) |
@@ -145,7 +163,9 @@ The key is embedded in the user-data document. `provision.py` shreds the on-disk
 curl http://169.254.169.254/metadata/v1/user-data   # DigitalOcean
 ```
 
-Anything on the VM that can reach `169.254.169.254` can recover it. So: **use a single-use key for cloud-init** — it's consumed on first boot and a leaked copy is then worthless. If you need a reusable key, use the SSH flow, which pipes it over the SSH channel and never writes it to user-data. Firewall the metadata service after boot if your provider allows it.
+Minted keys are single-use and expire in 10 minutes, so one recovered this way is already spent and expired — this is why minting is the default. If you supply your own reusable `TS_AUTHKEY` instead, the exposure is real: use the SSH flow, which pipes the key over the SSH channel and never writes it to user-data.
+
+Your OAuth client secret is never part of this. It stays on your machine; only the short-lived key it mints travels.
 
 ### SSH flow is trust-on-first-use
 
