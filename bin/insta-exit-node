@@ -7,6 +7,8 @@
 insta-exit-node — stand up a Tailscale exit node on a Debian/Ubuntu VM.
 
 Subcommands:
+  create      Create a VM at a provider and provision it into an exit node.
+  destroy     Destroy a VM at a provider.
   ssh         Provision an already-running VM over SSH.
   cloud-init  Emit a cloud-init user-data document that self-provisions on first boot.
   authkey     Mint a short-lived auth key and print it.
@@ -29,7 +31,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 PROVISION_PY = REPO_ROOT / "provision.py"
 
 sys.path.insert(0, str(REPO_ROOT))
-import tsapi  # noqa: E402  — needs REPO_ROOT on sys.path first
+import providers  # noqa: E402  — needs REPO_ROOT on sys.path first
+import tsapi  # noqa: E402
 
 
 def log(msg):
@@ -186,7 +189,8 @@ def cmd_ssh(args):
     sys.exit(result.returncode)
 
 
-def cmd_cloud_init(args):
+def render_cloud_config(args):
+    """Build the #cloud-config document, minting an auth key if none was given."""
     if not PROVISION_PY.exists():
         sys.exit(f"Error: provision.py not found at {PROVISION_PY}")
 
@@ -217,7 +221,100 @@ runcmd:
 {runcmd_item}
   - shred -u /root/.ts-authkey 2>/dev/null || rm -f /root/.ts-authkey
 """
-    print(cloud_config, end="")
+    return cloud_config
+
+
+def cmd_cloud_init(args):
+    print(render_cloud_config(args), end="")
+
+
+def cmd_create(args):
+    """Create a VM at a provider that provisions itself into an exit node."""
+    try:
+        provider = providers.get_provider(args.provider, args.provider_token)
+    except providers.ProviderError as exc:
+        sys.exit(f"Error: {exc}")
+
+    name = args.name or args.hostname or "insta-exit-1"
+    region = args.region or provider.defaults["region"]
+    size = args.size or provider.defaults["size"]
+    image = args.image or provider.defaults["image"]
+    # Keep the tailnet node name and the VM name the same, so `destroy --name`
+    # and the Tailscale admin console agree.
+    args.hostname = args.hostname or name
+
+    # Renders the user-data, which mints the key and runs the policy preflight.
+    # Done before touching the provider so a policy problem costs nothing.
+    user_data = render_cloud_config(args)
+
+    log(f"Creating {provider.name} VM {name!r} ({size}, {image}, {region})...")
+    try:
+        server = provider.create(
+            name=name,
+            region=region,
+            size=size,
+            image=image,
+            ssh_keys=args.ssh_keys,
+            user_data=user_data,
+        )
+        if not server["ip"]:
+            log("Waiting for a public IP...")
+            server = provider.wait_for_ip(server["id"], timeout=args.wait_timeout)
+    except providers.ProviderError as exc:
+        sys.exit(f"Error: {exc}")
+
+    log(f"Created {server['name']} (id {server['id']}) at {server['ip']}")
+    log("Cloud-init is provisioning Tailscale; the node should appear in 60-90s.")
+    log(f"Tear down with: insta-exit-node destroy --provider {provider.name} --name {name}")
+    print(server["ip"])
+
+
+def cmd_destroy(args):
+    """Destroy a VM at a provider."""
+    try:
+        provider = providers.get_provider(args.provider, args.provider_token)
+        matches = provider.find(args.name)
+    except providers.ProviderError as exc:
+        sys.exit(f"Error: {exc}")
+
+    if not matches:
+        sys.exit(f"Error: no {provider.name} VM named {args.name!r}.")
+
+    listing = ", ".join(
+        f"{m['name']} (id {m['id']}, {m['ip'] or 'no IP'})" for m in matches
+    )
+    if not args.yes:
+        # Destroying a VM is irreversible, so never do it unattended by accident.
+        if not sys.stdin.isatty():
+            sys.exit(
+                f"Error: refusing to destroy {listing} without --yes "
+                "(stdin is not a terminal)."
+            )
+        print(f"About to permanently destroy: {listing}", file=sys.stderr)
+        if input("Type 'yes' to confirm: ").strip().lower() != "yes":
+            sys.exit("Aborted; nothing was destroyed.")
+
+    for match in matches:
+        log(f"Destroying {match['name']} (id {match['id']})...")
+        try:
+            provider.delete(match["id"])
+        except providers.ProviderError as exc:
+            sys.exit(f"Error: {exc}")
+    log("Done. Ephemeral Tailscale nodes leave the console within a few minutes.")
+
+
+def add_provider_args(p):
+    p.add_argument(
+        "--provider",
+        required=True,
+        choices=sorted(providers.PROVIDERS),
+        help="Hosting provider",
+    )
+    p.add_argument(
+        "--provider-token",
+        metavar="TOKEN",
+        help="Provider API token (default: from the provider's env var)",
+    )
 
 
 def cmd_authkey(args):
@@ -306,8 +403,13 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  # Mint a key automatically from OAuth client credentials
+  # Create a VM and provision it, end to end
   export TS_OAUTH_CLIENT_ID=... TS_OAUTH_CLIENT_SECRET=tskey-client-...
+  export DIGITALOCEAN_TOKEN=dop_v1_...
+  uv run bin/insta-exit-node create --provider digitalocean --tag tag:exit
+  uv run bin/insta-exit-node destroy --provider digitalocean --name insta-exit-1
+
+  # Provision a VM you already have
   uv run bin/insta-exit-node ssh --host root@1.2.3.4 --hostname my-exit --tag tag:exit
 
   # Generate cloud-init user-data (pipe into your provider's CLI)
@@ -344,6 +446,41 @@ examples:
     )
     add_shared_args(key_p)
 
+    create_p = subparsers.add_parser(
+        "create",
+        help="Create a VM at a provider that provisions itself into an exit node.",
+    )
+    add_provider_args(create_p)
+    create_p.add_argument(
+        "--name", help="VM name (default: --hostname, else insta-exit-1)"
+    )
+    create_p.add_argument("--region", help="Region/location (default: provider's)")
+    create_p.add_argument("--size", help="Instance type (default: provider's)")
+    create_p.add_argument("--image", help="OS image (default: provider's Ubuntu LTS)")
+    create_p.add_argument(
+        "--ssh-key",
+        action="append",
+        dest="ssh_keys",
+        default=[],
+        metavar="KEY",
+        help="SSH key already registered with the provider, by ID or name (repeatable)",
+    )
+    create_p.add_argument(
+        "--wait-timeout",
+        type=int,
+        default=180,
+        metavar="SECONDS",
+        help="How long to wait for a public IP (default: 180)",
+    )
+    add_shared_args(create_p)
+
+    destroy_p = subparsers.add_parser("destroy", help="Destroy a VM at a provider.")
+    add_provider_args(destroy_p)
+    destroy_p.add_argument("--name", required=True, help="VM name to destroy")
+    destroy_p.add_argument(
+        "--yes", action="store_true", help="Skip the confirmation prompt"
+    )
+
     args = parser.parse_args()
     if args.command == "ssh":
         cmd_ssh(args)
@@ -351,6 +488,10 @@ examples:
         cmd_cloud_init(args)
     elif args.command == "authkey":
         cmd_authkey(args)
+    elif args.command == "create":
+        cmd_create(args)
+    elif args.command == "destroy":
+        cmd_destroy(args)
 
 
 if __name__ == "__main__":

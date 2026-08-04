@@ -1,23 +1,28 @@
 # insta-exit-node
 
-Stand up a [Tailscale](https://tailscale.com) exit node on any Debian/Ubuntu VPS in about two minutes. Works with DigitalOcean, Hetzner, Vultr, Linode, AWS Lightsail — anything offering SSH access or cloud-init user-data.
+Stand up a [Tailscale](https://tailscale.com) exit node in about two minutes. One command creates the VM, provisions it, and registers it as an approved exit node. You need a Tailscale OAuth client and a provider API token:
 
-Two flows, both running the same idempotent on-VM provisioner (`provision.py`):
+```bash
+uv run bin/insta-exit-node create --provider hetzner --region fsn1 --tag tag:exit
+```
+
+Three flows, all running the same idempotent on-VM provisioner (`provision.py`):
 
 | Flow | Use when |
 |---|---|
+| **create / destroy** | You want the whole lifecycle managed (DigitalOcean, Hetzner) |
 | **SSH** | The VM already exists and you can SSH in |
-| **cloud-init** | You want the VM to provision itself on first boot |
+| **cloud-init** | You want to hand the user-data document to another provider yourself |
 
 ## Quickstart
 
 1. Install [`uv`](https://docs.astral.sh/uv/).
 2. [Set up Tailscale](#1-tailscale-setup) — auto-approver ACL, then an OAuth client tagged `tag:exit`.
 3. `cp examples/.env.example examples/.env && chmod 600 examples/.env`, then fill it in.
-4. Run the [SSH](#2a-ssh-flow) or [cloud-init](#2b-cloud-init-flow) flow.
-5. [Use it](#3-use-the-exit-node) from any device on your tailnet.
+4. [Create a VM](#2-create-a-vm), or provision [one you already have](#3-provision-a-vm-you-already-have).
+5. [Use it](#4-use-the-exit-node) from any device on your tailnet.
 
-**Prerequisites:** `uv` locally, plus `ssh`/`scp` for the SSH flow. A Debian/Ubuntu VM with `VERSION_CODENAME` in `/etc/os-release` and root or passwordless-sudo access. Any Tailscale account.
+**Prerequisites:** `uv` locally, and any Tailscale account. `create` also needs a DigitalOcean or Hetzner API token. The other flows need `ssh`/`scp` locally, and a Debian/Ubuntu VM with `VERSION_CODENAME` in `/etc/os-release` and root or passwordless-sudo access.
 
 ## 1. Tailscale setup
 
@@ -56,17 +61,49 @@ Each run mints its own auth key: single-use, ephemeral, pre-authorized, expiring
 
 > **Prefer to manage keys yourself?** Set `TS_AUTHKEY` (or pass `--authkey`) to skip minting. Generate the key under **Settings → Keys** with **Ephemeral** ✓ and **Tags** `tag:exit`.
 
-## 2a. SSH flow
+## 2. Create a VM
 
-Create a VM however you like — DigitalOcean example (`doctl compute ssh-key list` for the fingerprint):
+Set a provider token, then:
 
 ```bash
-doctl compute droplet create insta-exit-1 \
-  --image ubuntu-24-04-x64 --size s-1vcpu-512mb-10gb --region nyc3 \
-  --ssh-keys <fingerprint> --wait
+export DIGITALOCEAN_TOKEN=dop_v1_...        # or HCLOUD_TOKEN for Hetzner
+uv run bin/insta-exit-node create --provider digitalocean --tag tag:exit
 ```
 
-Set `EXIT_HOST=root@<ip>` from the output, then:
+```
+[insta-exit-node] Policy OK (tag:exit auto-approved as an exit node).
+[insta-exit-node] Minting auth key (single-use, ephemeral, expires in 600s)...
+[insta-exit-node] Creating digitalocean VM 'insta-exit-1' (s-1vcpu-512mb-10gb, ubuntu-24-04-x64, nyc3)...
+[insta-exit-node] Created insta-exit-1 (id 777) at 203.0.113.9
+203.0.113.9
+```
+
+Only the IP goes to stdout, so `IP=$(uv run bin/insta-exit-node create ...)` works.
+
+| Provider | Token env | Defaults |
+|---|---|---|
+| `digitalocean` | `DIGITALOCEAN_TOKEN` or `DO_API_TOKEN` | `nyc3` · `s-1vcpu-512mb-10gb` · `ubuntu-24-04-x64` |
+| `hetzner` | `HCLOUD_TOKEN` | `nbg1` · `cx22` · `ubuntu-24.04` |
+
+Override the defaults with `--region`, `--size`, and `--image`. If a value is wrong, the provider's error names the valid ones. `--ssh-key` (repeatable) installs a key already registered with the provider. Provisioning does not need it, but it lets you SSH in to debug.
+
+### Teardown
+
+```bash
+uv run bin/insta-exit-node destroy --provider digitalocean --name insta-exit-1
+```
+
+`destroy` prompts before it deletes anything. `--yes` skips the prompt, and is required when stdin is not a terminal. Auth keys are ephemeral, so the Tailscale node leaves the console on its own within a few minutes.
+
+Provider tokens stay on your machine. They never enter the user-data document and never reach the VM.
+
+## 3. Provision a VM you already have
+
+Use these flows for any provider `create` does not cover.
+
+### SSH
+
+Set `EXIT_HOST=root@<ip>` in `examples/.env`, then:
 
 ```bash
 ./examples/run.sh
@@ -85,9 +122,9 @@ The command checks your tailnet policy and mints a key before touching the VM. I
 
 If the auto-approver ACL is missing, the policy check fails before any VM work happens. The error includes the snippet to paste. Pass `--no-preflight` to skip the check.
 
-## 2b. cloud-init flow
+### cloud-init
 
-Bakes `provision.py` and your auth key into a `#cloud-config` user-data document. The VM runs it on first boot, so you never SSH in.
+Bakes `provision.py` and your auth key into a `#cloud-config` user-data document. The VM runs it on first boot, so you never SSH in. `create` uses the same document. Run this subcommand directly to hand it to any other provider.
 
 ```bash
 uv run bin/insta-exit-node cloud-init --hostname insta-exit-1 --tag tag:exit > userdata.yaml
@@ -101,7 +138,7 @@ Or use the example wrapper: `DO_SSH_KEY=<fingerprint> ./examples/cloud-init-digi
 
 The document writes `provision.py` and the auth key (mode `0600`, root-only). It runs the provisioner, then shreds the key. Wait 60–90s after creation, then check the [admin console](https://login.tailscale.com/admin/machines).
 
-## 3. Use the exit node
+## 4. Use the exit node
 
 ```bash
 tailscale up --exit-node=insta-exit-1 --exit-node-allow-lan-access=false
@@ -110,15 +147,19 @@ curl https://api.ipify.org      # should show the VM's public IP
 tailscale up --exit-node=       # stop routing through it
 ```
 
-**Teardown:** destroy the VM at your provider. Because the key was ephemeral, the node disappears from the console within a few minutes.
+**Teardown:** run [`destroy`](#teardown), or remove the VM yourself at any provider `create` does not cover.
 
 ## CLI reference
 
 ```
+uv run bin/insta-exit-node create  --provider NAME [options]
+uv run bin/insta-exit-node destroy --provider NAME --name VM [--yes]
 uv run bin/insta-exit-node ssh --host USER@IP [options]
 uv run bin/insta-exit-node cloud-init [options]
 uv run bin/insta-exit-node authkey [options]     # mint a key, print it
 ```
+
+`create`-only flags: `--name`, `--region`, `--size`, `--image`, `--ssh-key` (repeatable), `--wait-timeout`. Both provider commands take `--provider` and `--provider-token`.
 
 Key resolution order: `--authkey` → `--authkey-file` → `$TS_AUTHKEY` → mint via the API. Progress messages go to stderr, so `cloud-init` and `authkey` output can be redirected safely.
 
@@ -179,10 +220,10 @@ Bandwidth is the main cost driver:
 
 | Provider | Included bandwidth | Notes |
 |---|---|---|
-| **Hetzner** | ~20 TB/mo | Best value EU/US; cheapest sustained throughput |
-| **OVHcloud / Contabo** | Unmetered (throttled) | Good for high volume |
-| **DigitalOcean** | 500 GB – 1 TB | Easiest DX; `doctl` is polished |
-| **Vultr / Linode** | 1–2 TB | Comparable to DO |
-| **AWS Lightsail** | 1–3 TB | Useful if you're already in AWS |
+| **Hetzner** | ~20 TB/mo | Best value EU/US; cheapest sustained throughput. `create` supported |
+| **DigitalOcean** | 500 GB – 1 TB | Easiest DX. `create` supported |
+| **OVHcloud / Contabo** | Unmetered (throttled) | Good for high volume; use the cloud-init flow |
+| **Vultr / Linode** | 1–2 TB | Comparable to DO; use the cloud-init flow |
+| **AWS Lightsail** | 1–3 TB | Useful if you're already in AWS; use the cloud-init flow |
 
 Serverless platforms (Lambda, Cloud Run, Vercel) can't hold a persistent WireGuard tunnel. They won't work. Fly.io Machines do work ([guide](https://tailscale.com/kb/1132/flydotio)), but meter egress at ~$0.02/GB past 100 GB — expensive for an exit node.
