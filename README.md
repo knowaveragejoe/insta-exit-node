@@ -1,6 +1,6 @@
 # insta-exit-node
 
-Stand up a [Tailscale](https://tailscale.com) exit node in about two minutes. One command creates the VM, provisions it, and registers it as an approved exit node. You need a Tailscale OAuth client and a provider API token:
+Stand up a [Tailscale](https://tailscale.com) exit node in about two minutes. You need a Tailscale OAuth client and a provider API token. One command then creates the VM, provisions it, and registers it as approved:
 
 ```bash
 uv run bin/insta-exit-node create --provider hetzner --region fsn1 --tag tag:exit
@@ -10,9 +10,9 @@ Three flows, all running the same idempotent on-VM provisioner (`provision.py`):
 
 | Flow | Use when |
 |---|---|
-| **create / destroy** | You want the whole lifecycle managed (DigitalOcean, Hetzner) |
+| **create / destroy** | You're on DigitalOcean or Hetzner and want the VM managed too |
 | **SSH** | The VM already exists and you can SSH in |
-| **cloud-init** | You want to hand the user-data document to another provider yourself |
+| **cloud-init** | You want to hand the user-data document to another provider |
 
 ## Quickstart
 
@@ -22,7 +22,7 @@ Three flows, all running the same idempotent on-VM provisioner (`provision.py`):
 4. [Create a VM](#2-create-a-vm), or provision [one you already have](#3-provision-a-vm-you-already-have).
 5. [Use it](#4-use-the-exit-node) from any device on your tailnet.
 
-**Prerequisites:** `uv` locally, and any Tailscale account. `create` also needs a DigitalOcean or Hetzner API token. The other flows need `ssh`/`scp` locally, and a Debian/Ubuntu VM with `VERSION_CODENAME` in `/etc/os-release` and root or passwordless-sudo access.
+**Prerequisites:** `uv` locally, and any Tailscale account. `create` also needs a DigitalOcean or Hetzner API token. The other flows need `ssh`/`scp` locally. They also need a Debian/Ubuntu VM with `VERSION_CODENAME` in `/etc/os-release`, and root or passwordless-sudo access.
 
 ## 1. Tailscale setup
 
@@ -57,7 +57,7 @@ EXIT_HOSTNAME=insta-exit-1
 EXIT_TAG=tag:exit
 ```
 
-Each run mints its own auth key: single-use, ephemeral, pre-authorized, expiring in 10 minutes. There is no key to store, rotate, or revoke. The client secret stays on your machine — it never enters the user-data document, never reaches the VM, and is never logged.
+Each run mints its own auth key: single-use, ephemeral, pre-authorized, expiring in 10 minutes. There is no key to store, rotate, or revoke. The client secret stays on your machine. It never enters the user-data document, never reaches the VM, and is never logged.
 
 > **Prefer to manage keys yourself?** Set `TS_AUTHKEY` (or pass `--authkey`) to skip minting. Generate the key under **Settings → Keys** with **Ephemeral** ✓ and **Tags** `tag:exit`.
 
@@ -147,7 +147,7 @@ curl https://api.ipify.org      # should show the VM's public IP
 tailscale up --exit-node=       # stop routing through it
 ```
 
-**Teardown:** run [`destroy`](#teardown), or remove the VM yourself at any provider `create` does not cover.
+**Teardown:** run [`destroy`](#teardown), or remove the VM at any provider `create` does not cover.
 
 ## CLI reference
 
@@ -161,7 +161,7 @@ uv run bin/insta-exit-node authkey [options]     # mint a key, print it
 
 `create`-only flags: `--name`, `--region`, `--size`, `--image`, `--ssh-key` (repeatable), `--wait-timeout`. Both provider commands take `--provider` and `--provider-token`.
 
-Key resolution order: `--authkey` → `--authkey-file` → `$TS_AUTHKEY` → mint via the API. Progress messages go to stderr, so `cloud-init` and `authkey` output can be redirected safely.
+Key resolution order: `--authkey` → `--authkey-file` → `$TS_AUTHKEY` → mint via the API. Progress messages go to stderr, so you can redirect `cloud-init` and `authkey` output safely.
 
 | Flag | Default | Description |
 |---|---|---|
@@ -190,7 +190,7 @@ ssh root@<ip> 'cat /var/log/cloud-init-output.log'  # cloud-init flow
 ssh root@<ip> 'tailscale status'
 ```
 
-**Node never appears:** check the VM has outbound internet, the key is valid and unexpired, and `journalctl -u tailscaled` for errors.
+**Node never appears:** confirm the VM has outbound internet, and that the key is valid and unexpired. Check `journalctl -u tailscaled` for errors.
 
 **Node appears but can't be selected:** the provisioner catches this. It ends with a `WARNING:` block instead of `Exit node is advertised and approved`. Add the `autoApprovers.exitNode` ACL rule, or approve manually under **Machines → (node) → Edit route settings**. Then re-run the provisioner — it's idempotent — to confirm.
 
@@ -198,7 +198,7 @@ ssh root@<ip> 'tailscale status'
 
 ### Auth key exposure (cloud-init)
 
-The key is embedded in the user-data document. `provision.py` shreds the on-disk copy. But **the user-data document stays readable from inside the VM** for the instance's lifetime:
+The user-data document contains the key. `provision.py` shreds the on-disk copy. But **the document stays readable from inside the VM** for the instance's lifetime:
 
 ```bash
 curl http://169.254.169.254/metadata/v1/user-data   # DigitalOcean
@@ -226,4 +226,4 @@ Bandwidth is the main cost driver:
 | **Vultr / Linode** | 1–2 TB | Comparable to DO; use the cloud-init flow |
 | **AWS Lightsail** | 1–3 TB | Useful if you're already in AWS; use the cloud-init flow |
 
-Serverless platforms (Lambda, Cloud Run, Vercel) can't hold a persistent WireGuard tunnel. They won't work. Fly.io Machines do work ([guide](https://tailscale.com/kb/1132/flydotio)), but meter egress at ~$0.02/GB past 100 GB — expensive for an exit node.
+Serverless platforms (Lambda, Cloud Run, Vercel) won't work: they can't hold a persistent WireGuard tunnel. Fly.io Machines do work ([guide](https://tailscale.com/kb/1132/flydotio)), but meter egress at ~$0.02/GB past 100 GB — expensive for an exit node.
