@@ -1,12 +1,17 @@
 # insta-exit-node
 
-Stand up a [Tailscale](https://tailscale.com) exit node in about two minutes. You need a Tailscale OAuth client and a provider API token. One command then creates the VM, provisions it, and registers it as approved:
+Stand up a [Tailscale](https://tailscale.com) exit node in about two minutes. You need a Tailscale OAuth client and a provider API token. 
 
+## Simple example
+One command then creates the VM, provisions it, and registers it as approved:
+ 
 ```bash
 uv run bin/insta-exit-node create --provider hetzner --region fsn1 --tag tag:exit
 ```
 
-Three flows, all running the same idempotent on-VM provisioner (`provision.py`):
+## Flexible usage
+
+This tool supports three different flows depending on your use-case:
 
 | Flow | Use when |
 |---|---|
